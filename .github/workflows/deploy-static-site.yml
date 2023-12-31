@@ -1,0 +1,52 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      AWS_ROLE_TO_ASSUME:
+        description: "The AWS role to assume"
+        required: true
+        type: string
+      AWS_REGION:
+        description: "The AWS region"
+        required: true
+        type: string
+      AWS_BUCKET_NAME:
+        description: "The AWS bucket name for staging"
+        required: true
+        type: string
+      AWS_CLOUDFRONT_ID:
+        description: "The AWS CloudFront ID for staging"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 20
+          cache: "yarn"
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.AWS_ROLE_TO_ASSUME }}
+          role-session-name: ${{ github.sha }}
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      - name: Build
+        run: |
+          yarn install
+          yarn build
+
+      - name: Deploy
+        run: |
+          aws s3 sync build/ s3://${{ inputs.AWS_BUCKET_NAME }} --delete
+
+      - name: Invalidate CloudFront
+        if: ${{ inputs.AWS_CLOUDFRONT_ID }}
+        run: |
+          aws cloudfront create-invalidation --distribution-id ${{ inputs.AWS_CLOUDFRONT_ID }} --paths "/*"
