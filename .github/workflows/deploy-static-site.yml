@@ -7,10 +7,12 @@ on:
         description: "The AWS role to assume"
         required: true
         type: string
+        default: arn:aws:iam::002745052429:role/github-actions
       AWS_REGION:
         description: "The AWS region"
         required: true
         type: string
+        default: "ca-central-1"
       AWS_BUCKET_NAME:
         description: "The AWS bucket name for staging"
         required: true
