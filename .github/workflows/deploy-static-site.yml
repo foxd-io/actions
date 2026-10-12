@@ -1,52 +1,112 @@
-name: Deploy
+name: Deploy static site
+
+# Builds a yarn site and syncs it to the GCS bucket "<bucket_prefix>-<env>".
+# The calling workflow must grant `id-token: write` for Workload Identity.
+#
+#   jobs:
+#     deploy:
+#       uses: foxd-io/actions/.github/workflows/deploy-static-site.yml@v1
+#       with:
+#         bucket_prefix: www-foxd-io
 
 on:
   workflow_call:
     inputs:
-      AWS_ROLE_TO_ASSUME:
-        description: "The AWS role to assume"
-        type: string
-        default: arn:aws:iam::002745052429:role/github-actions
-      AWS_REGION:
-        description: "The AWS region"
-        type: string
-        default: "ca-central-1"
-      AWS_BUCKET_NAME:
-        description: "The AWS bucket name for staging"
+      bucket_prefix:
+        description: "Bucket name without the -dev/-prod suffix"
         required: true
         type: string
-      AWS_CLOUDFRONT_ID:
-        description: "The AWS CloudFront ID for staging"
+      environment:
+        description: "dev or prod. Empty derives it from the ref: tags deploy prod, anything else dev"
         type: string
+        default: ""
+      build_dir:
+        description: "Directory the build writes to"
+        type: string
+        default: "build"
+      immutable_dir:
+        description: "Content-hashed assets under build_dir, served with a one year cache. Empty disables"
+        type: string
+        default: "_app/immutable"
+      workload_identity_provider:
+        description: "Workload Identity provider resource name"
+        type: string
+        default: "projects/324306161120/locations/global/workloadIdentityPools/github/providers/github-actions"
+      service_account:
+        description: "Service account to impersonate"
+        type: string
+        default: "github-actions@foxd-io.iam.gserviceaccount.com"
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BUILD_DIR: ${{ inputs.build_dir }}
+      IMMUTABLE_DIR: ${{ inputs.immutable_dir }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Resolve bucket
+        env:
+          PREFIX: ${{ inputs.bucket_prefix }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$ENVIRONMENT" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/*) ENVIRONMENT=prod ;;
+              *) ENVIRONMENT=dev ;;
+            esac
+          fi
+          if [ "$ENVIRONMENT" != dev ] && [ "$ENVIRONMENT" != prod ]; then
+            echo "::error::environment must be dev or prod, got '$ENVIRONMENT'"
+            exit 1
+          fi
+          echo "BUCKET=gs://$PREFIX-$ENVIRONMENT" >> "$GITHUB_ENV"
+          echo "Deploying to gs://$PREFIX-$ENVIRONMENT" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 20
-          cache: "yarn"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          role-to-assume: ${{ inputs.AWS_ROLE_TO_ASSUME }}
-          role-session-name: ${{ github.sha }}
-          aws-region: ${{ inputs.AWS_REGION }}
+          node-version-file: package.json
+          cache: yarn
 
       - name: Build
         run: |
-          yarn install
+          yarn install --frozen-lockfile
           yarn build
 
-      - name: Deploy
-        run: |
-          aws s3 sync build/ s3://${{ inputs.AWS_BUCKET_NAME }} --delete
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
 
-      - name: Invalidate CloudFront
-        if: ${{ inputs.AWS_CLOUDFRONT_ID }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # Order matters so a visitor never loads a page whose assets are missing:
+      # new hashed assets go up first, then the pages that reference them, and
+      # only then are the old hashed assets removed.
+      - name: Upload immutable assets
+        if: inputs.immutable_dir != ''
         run: |
-          aws cloudfront create-invalidation --distribution-id ${{ inputs.AWS_CLOUDFRONT_ID }} --paths "/*"
+          gcloud storage rsync --recursive \
+            --cache-control="public, max-age=31536000, immutable" \
+            "$BUILD_DIR/$IMMUTABLE_DIR" "$BUCKET/$IMMUTABLE_DIR"
+
+      - name: Sync site
+        run: |
+          EXCLUDE=()
+          if [ -n "$IMMUTABLE_DIR" ]; then
+            EXCLUDE=(--exclude="^${IMMUTABLE_DIR//./\\.}/.*")
+          fi
+          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+            "${EXCLUDE[@]}" "$BUILD_DIR" "$BUCKET"
+
+      - name: Remove stale immutable assets
+        if: inputs.immutable_dir != ''
+        run: |
+          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+            --cache-control="public, max-age=31536000, immutable" \
+            "$BUILD_DIR/$IMMUTABLE_DIR" "$BUCKET/$IMMUTABLE_DIR"
