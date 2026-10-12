@@ -4,7 +4,9 @@ name: Update major tag
 # up compatible changes without editing their workflows.
 #
 # - Publishing a release vX.Y.Z moves vX to that release's commit.
-# - Running it manually moves the given tag to the commit of the chosen ref.
+# - Running it manually moves the given tag to the chosen ref, which must be a
+#   vX.Y.Z release tag of the same major. A branch can never become @v1, so
+#   unreviewed code cannot reach every caller's deploy.
 
 on:
   release:
@@ -43,6 +45,10 @@ jobs:
             MAJOR="${RELEASE_TAG%%.*}"
           else
             MAJOR="$INPUT_TAG"
+            if ! [[ "$GITHUB_REF" =~ ^refs/tags/(v[0-9]+)\.[0-9]+\.[0-9]+$ ]] || [ "${BASH_REMATCH[1]}" != "$MAJOR" ]; then
+              echo "::error::run this from a $MAJOR.x.y release tag, not $GITHUB_REF"
+              exit 1
+            fi
           fi
 
           if ! [[ "$MAJOR" =~ ^v[0-9]+$ ]]; then

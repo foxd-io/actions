@@ -16,6 +16,11 @@ name: Deploy Cloud Run
 # The image is tagged with the commit and shared by every environment, so a
 # release tag on a commit main already built promotes that image instead of
 # building it again.
+#
+# Three jobs keep repository code away from the deploy token:
+#   resolve  (id-token, no checkout)   names the target, checks for the image
+#   build    (no id-token)             docker build to a tarball artifact
+#   deploy   (id-token, no checkout)   loads and pushes the image, updates Cloud Run
 
 on:
   workflow_call:
@@ -58,21 +63,27 @@ on:
         default: ""
 
 jobs:
-  deploy:
+  resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
-    env:
-      REGION: ${{ inputs.region }}
+    outputs:
+      service: ${{ steps.target.outputs.service }}
+      jobs: ${{ steps.target.outputs.jobs }}
+      image: ${{ steps.target.outputs.image }}
+      service_account: ${{ steps.target.outputs.service_account }}
+      found: ${{ steps.existing.outputs.found }}
     steps:
       - name: Resolve target
+        id: target
         env:
           PREFIX: ${{ inputs.service_prefix }}
           ENVIRONMENT: ${{ inputs.environment }}
           JOB_PREFIXES: ${{ inputs.jobs }}
           PROJECT: ${{ inputs.project }}
+          REGION: ${{ inputs.region }}
           SERVICE_ACCOUNT: ${{ inputs.service_account }}
         run: |
           if [ -z "$ENVIRONMENT" ]; then
@@ -104,15 +115,16 @@ jobs:
             JOBS="$JOBS $job-$ENVIRONMENT"
           done
 
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT/$OWNER/$REPO/$PREFIX:$GITHUB_SHA"
           {
-            echo "SERVICE=$PREFIX-$ENVIRONMENT"
-            echo "JOBS=$JOBS"
-            echo "IMAGE=$REGION-docker.pkg.dev/$PROJECT/$OWNER/$REPO/$PREFIX:$GITHUB_SHA"
-            echo "SERVICE_ACCOUNT=$SERVICE_ACCOUNT"
-          } >> "$GITHUB_ENV"
+            echo "service=$PREFIX-$ENVIRONMENT"
+            echo "jobs=$JOBS"
+            echo "image=$IMAGE"
+            echo "service_account=$SERVICE_ACCOUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "SERVICE_ACCOUNT=$SERVICE_ACCOUNT" >> "$GITHUB_ENV"
           echo "Deploying $PREFIX-$ENVIRONMENT as $SERVICE_ACCOUNT" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -126,28 +138,82 @@ jobs:
       - name: Check for an existing image
         id: existing
         run: |
-          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
           if gcloud artifacts docker images describe "$IMAGE" >/dev/null 2>&1; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "Reusing $IMAGE" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.found != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # No id-token: the Dockerfile and everything it installs run without any
+    # way to reach Google Cloud.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        if: steps.existing.outputs.found != 'true'
 
       # Layers are cached in the GitHub Actions cache, scoped per service, so
       # dependency stages are only rebuilt when their inputs change.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        if: steps.existing.outputs.found != 'true'
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
-          push: true
-          tags: ${{ env.IMAGE }}
+          push: false
+          tags: ${{ needs.resolve.outputs.image }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
           # A single-platform manifest, without attestation entries.
           provenance: false
           cache-from: type=gha,scope=${{ inputs.service_prefix }}
           cache-to: type=gha,mode=max,scope=${{ inputs.service_prefix }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    needs: [resolve, build]
+    # Runs after a build, or straight away when the image already exists.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: ${{ inputs.region }}
+      SERVICE: ${{ needs.resolve.outputs.service }}
+      JOBS: ${{ needs.resolve.outputs.jobs }}
+      IMAGE: ${{ needs.resolve.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build.result == 'success'
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ needs.resolve.outputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Push image
+        if: needs.build.result == 'success'
+        run: |
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+          docker load --input "$RUNNER_TEMP/image.tar"
+          docker push "$IMAGE"
 
       - name: Deploy service
         run: gcloud run services update "$SERVICE" --image="$IMAGE" --region="$REGION" --quiet
