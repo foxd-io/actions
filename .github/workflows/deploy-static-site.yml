@@ -1,6 +1,6 @@
 name: Deploy static site
 
-# Builds a yarn site and syncs it to the GCS bucket "<bucket_prefix>-<env>".
+# Builds a site and syncs it to the GCS bucket "<bucket_prefix>-<env>".
 # The calling workflow must grant `id-token: write` for Workload Identity.
 #
 #   jobs:
@@ -8,6 +8,10 @@ name: Deploy static site
 #       uses: foxd-io/actions/.github/workflows/deploy-static-site.yml@v1
 #       with:
 #         bucket_prefix: www-foxd-io
+#
+# It deploys as gh-<repository with dots as dashes>, the per-repo account the
+# foxd-io/infra base stack creates, which only has access to that repo's
+# buckets. Prod only deploys from a v* tag.
 
 on:
   workflow_call:
@@ -21,21 +25,37 @@ on:
         type: string
         default: ""
       build_dir:
-        description: "Directory the build writes to"
+        description: "Directory the build writes to, relative to the repository root"
         type: string
         default: "build"
       immutable_dir:
         description: "Content-hashed assets under build_dir, served with a one year cache. Empty disables"
         type: string
         default: "_app/immutable"
+      package_manager:
+        description: "yarn or npm. Picks the dependency cache and the default commands"
+        type: string
+        default: "yarn"
+      install_command:
+        description: "Installs dependencies. Empty uses `yarn install --frozen-lockfile` or `npm ci`"
+        type: string
+        default: ""
+      build_command:
+        description: "Builds the site into build_dir. Empty uses `yarn build` or `npm run build`"
+        type: string
+        default: ""
+      node_version:
+        description: "Node version. Empty reads it from package.json"
+        type: string
+        default: ""
       workload_identity_provider:
         description: "Workload Identity provider resource name"
         type: string
         default: "projects/324306161120/locations/global/workloadIdentityPools/github/providers/github-actions"
       service_account:
-        description: "Service account to impersonate"
+        description: "Service account to impersonate. Empty uses the repo's gh-<repo>@foxd-io.iam.gserviceaccount.com"
         type: string
-        default: "github-actions@foxd-io.iam.gserviceaccount.com"
+        default: ""
 
 jobs:
   deploy:
@@ -48,10 +68,14 @@ jobs:
       BUILD_DIR: ${{ inputs.build_dir }}
       IMMUTABLE_DIR: ${{ inputs.immutable_dir }}
     steps:
-      - name: Resolve bucket
+      - name: Resolve target
         env:
           PREFIX: ${{ inputs.bucket_prefix }}
           ENVIRONMENT: ${{ inputs.environment }}
+          PACKAGE_MANAGER: ${{ inputs.package_manager }}
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
+          SERVICE_ACCOUNT: ${{ inputs.service_account }}
         run: |
           if [ -z "$ENVIRONMENT" ]; then
             case "$GITHUB_REF" in
@@ -63,50 +87,86 @@ jobs:
             echo "::error::environment must be dev or prod, got '$ENVIRONMENT'"
             exit 1
           fi
-          echo "BUCKET=gs://$PREFIX-$ENVIRONMENT" >> "$GITHUB_ENV"
-          echo "Deploying to gs://$PREFIX-$ENVIRONMENT" >> "$GITHUB_STEP_SUMMARY"
+          # Releases are tags, so prod never ships an untagged commit, even
+          # from a manual run.
+          if [ "$ENVIRONMENT" = prod ] && [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::prod only deploys from a v* tag, not $GITHUB_REF"
+            exit 1
+          fi
+
+          case "$PACKAGE_MANAGER" in
+            yarn)
+              : "${INSTALL_COMMAND:=yarn install --frozen-lockfile}"
+              : "${BUILD_COMMAND:=yarn build}"
+              ;;
+            npm)
+              : "${INSTALL_COMMAND:=npm ci}"
+              : "${BUILD_COMMAND:=npm run build}"
+              ;;
+            *)
+              echo "::error::package_manager must be yarn or npm, got '$PACKAGE_MANAGER'"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$SERVICE_ACCOUNT" ]; then
+            REPO="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:].' '[:lower:]-')"
+            SERVICE_ACCOUNT="gh-$REPO@foxd-io.iam.gserviceaccount.com"
+          fi
+
+          {
+            echo "BUCKET=gs://$PREFIX-$ENVIRONMENT"
+            echo "INSTALL_COMMAND=$INSTALL_COMMAND"
+            echo "BUILD_COMMAND=$BUILD_COMMAND"
+            echo "SERVICE_ACCOUNT=$SERVICE_ACCOUNT"
+          } >> "$GITHUB_ENV"
+          echo "Deploying to gs://$PREFIX-$ENVIRONMENT as $SERVICE_ACCOUNT" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version-file: package.json
-          cache: yarn
+          node-version: ${{ inputs.node_version }}
+          node-version-file: ${{ inputs.node_version == '' && 'package.json' || '' }}
+          cache: ${{ inputs.package_manager }}
 
       - name: Build
         run: |
-          yarn install --frozen-lockfile
-          yarn build
+          eval "$INSTALL_COMMAND"
+          eval "$BUILD_COMMAND"
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
-          service_account: ${{ inputs.service_account }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # Order matters so a visitor never loads a page whose assets are missing:
       # new hashed assets go up first, then the pages that reference them, and
-      # only then are the old hashed assets removed.
+      # only then are the old hashed assets removed. Checksums decide what
+      # changed, since every build gives every file a new modification time.
       - name: Upload immutable assets
         if: inputs.immutable_dir != ''
         run: |
-          gcloud storage rsync --recursive \
+          gcloud storage rsync --recursive --checksums-only \
             --cache-control="public, max-age=31536000, immutable" \
             "$BUILD_DIR/$IMMUTABLE_DIR" "$BUCKET/$IMMUTABLE_DIR"
 
+      # Pages are revalidated on every request, so a deploy is live at once
+      # rather than after the CDN's default hour.
       - name: Sync site
         run: |
           EXCLUDE=()
           if [ -n "$IMMUTABLE_DIR" ]; then
             EXCLUDE=(--exclude="^${IMMUTABLE_DIR//./\\.}/.*")
           fi
-          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
-            "${EXCLUDE[@]}" "$BUILD_DIR" "$BUCKET"
+          gcloud storage rsync --recursive --checksums-only --delete-unmatched-destination-objects \
+            --cache-control=no-cache "${EXCLUDE[@]}" "$BUILD_DIR" "$BUCKET"
 
       - name: Remove stale immutable assets
         if: inputs.immutable_dir != ''
         run: |
-          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+          gcloud storage rsync --recursive --checksums-only --delete-unmatched-destination-objects \
             --cache-control="public, max-age=31536000, immutable" \
             "$BUILD_DIR/$IMMUTABLE_DIR" "$BUCKET/$IMMUTABLE_DIR"
