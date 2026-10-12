@@ -1,0 +1,55 @@
+name: Update major tag
+
+# Callers pin to a major tag (@v1). This moves that tag forward so they pick
+# up compatible changes without editing their workflows.
+#
+# - Publishing a release vX.Y.Z moves vX to that release's commit.
+# - Running it manually moves the given tag to the commit of the chosen ref.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Major tag to move, e.g. v1"
+        required: true
+        default: "v1"
+
+concurrency:
+  group: update-major-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Move tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          # On a release, GITHUB_SHA is the release's commit; on a manual run,
+          # it is the commit of the ref picked in the run dialog.
+          SHA="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            MAJOR="${RELEASE_TAG%%.*}"
+          else
+            MAJOR="$INPUT_TAG"
+          fi
+
+          if ! [[ "$MAJOR" =~ ^v[0-9]+$ ]]; then
+            echo "::error::'$MAJOR' is not a major tag like v1"
+            exit 1
+          fi
+
+          git tag --force "$MAJOR" "$SHA"
+          git push --force origin "refs/tags/$MAJOR"
+          echo "Moved $MAJOR to $SHA" >> "$GITHUB_STEP_SUMMARY"
