@@ -17,6 +17,16 @@ name: Deploy static site
 # It deploys as gh-<repository with dots as dashes>, the per-repo account the
 # foxd-io/infra base stack creates, which only has access to that repo's
 # buckets. Prod only deploys from a v* tag.
+#
+# With `content: true`, the build also gets the site's owner-editable content
+# (events, vendors, ...) from api.foxd.io. Two more jobs then hold an id-token,
+# for the API rather than Google Cloud, and like `deploy` they run no
+# repository code: `content` checks out content.config.json alone, reads it as
+# data, and uses only curl and jq; `report` only calls curl. The `build` job
+# turns the fetched content into a typed module with `foxd-content generate`
+# from @foxd-io/content, which the site lists as a dev dependency. Dev builds
+# get drafts and push the schema; prod builds get published content. An admin
+# links the repository to its site in the API once.
 
 on:
   workflow_call:
@@ -53,6 +63,18 @@ on:
         description: "Extra environment for install and build, one NAME=value per line. Use it to pass vars instead of putting them inside build_command"
         type: string
         default: ""
+      content:
+        description: "Build with the site's editable content from api.foxd.io. Needs content.config.json and the @foxd-io/content dev dependency"
+        type: boolean
+        default: false
+      content_out:
+        description: "Directory the generated content module (index.js, index.d.ts) is written to"
+        type: string
+        default: "src/content"
+      content_api_url:
+        description: "API that serves the content. Also the audience of the OIDC token it is fetched with"
+        type: string
+        default: "https://api.foxd.io"
       node_version:
         description: "Node version. Empty reads it from package.json"
         type: string
@@ -67,7 +89,69 @@ on:
         default: ""
 
 jobs:
+  content:
+    if: inputs.content
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The id-token is for the API. Nothing from the repository runs here: the
+    # checkout is the schema file alone, sent as data.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      API_URL: ${{ inputs.content_api_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: content.config.json
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch content
+        run: |
+          set -euo pipefail
+          # call <output file> <curl args...>: fail the step with the API's
+          # error message rather than a bare status code.
+          call() {
+            local out="$1"; shift
+            if ! curl -sS --fail-with-body -o "$out" "$@"; then
+              echo "::error::$(jq -r '.message // .' "$out" 2>/dev/null || cat "$out")"
+              exit 1
+            fi
+          }
+
+          call "$RUNNER_TEMP/token.json" -G \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$API_URL" "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          TOKEN="$(jq -r .value "$RUNNER_TEMP/token.json")"
+          rm "$RUNNER_TEMP/token.json"
+          echo "::add-mask::$TOKEN"
+
+          # The schema belongs to main, so rebuilding an older release can
+          # never roll it back. The API enforces the same rule.
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            call "$RUNNER_TEMP/schema-sync.json" -X PUT \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+              --data-binary @content.config.json "$API_URL/site-build/schema"
+            jq -r '"Content schema: \(.created | length) created, \(.updated | length) updated, \(.archived | length) archived"' \
+              "$RUNNER_TEMP/schema-sync.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          call content.json -H "Authorization: Bearer $TOKEN" "$API_URL/site-build/content"
+          jq -r '"Content (\(.environment)): " + ([.types[] | "\(.key) \(.entries | length)"] | join(", "))' \
+            content.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: content
+          path: content.json
+          if-no-files-found: error
+          retention-days: 1
+
   build:
+    needs: content
+    # Runs when content is off (skipped) as well as when it was fetched.
+    if: ${{ !cancelled() && (needs.content.result == 'success' || needs.content.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # No id-token: nothing in this job can authenticate to Google Cloud.
@@ -158,10 +242,24 @@ jobs:
           node-version-file: ${{ inputs.node_version == '' && 'package.json' || '' }}
           cache: ${{ inputs.package_manager }}
 
+      - name: Install
+        run: eval "$INSTALL_COMMAND"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.content
+        with:
+          name: content
+          path: ${{ runner.temp }}/content
+
+      # The site's own pinned @foxd-io/content; never installs one.
+      - name: Generate content
+        if: inputs.content
+        env:
+          CONTENT_OUT: ${{ inputs.content_out }}
+        run: npm exec --no -- foxd-content generate --content "$RUNNER_TEMP/content/content.json" --out "$CONTENT_OUT"
+
       - name: Build
-        run: |
-          eval "$INSTALL_COMMAND"
-          eval "$BUILD_COMMAND"
+        run: eval "$BUILD_COMMAND"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -225,3 +323,36 @@ jobs:
           gcloud storage rsync --recursive --checksums-only --delete-unmatched-destination-objects \
             --cache-control="public, max-age=31536000, immutable" \
             "$BUILD_DIR/$IMMUTABLE_DIR" "$BUCKET/$IMMUTABLE_DIR"
+
+  # Tells the API how the deploy that read its content ended; the last
+  # succeeded prod deploy is the release a content publish rebuilds. Never
+  # fails the workflow.
+  report:
+    needs: [content, build, deploy]
+    if: ${{ always() && needs.content.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    steps:
+      - name: Report deploy
+        continue-on-error: true
+        env:
+          API_URL: ${{ inputs.content_api_url }}
+          RESULT: ${{ needs.deploy.result }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) STATUS=succeeded ;;
+            cancelled) STATUS=cancelled ;;
+            *) STATUS=failed ;;
+          esac
+          TOKEN="$(curl -sS --fail-with-body -G \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$API_URL" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)"
+          echo "::add-mask::$TOKEN"
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            --data "{\"status\":\"$STATUS\"}" "$API_URL/site-build/report" >/dev/null \
+            || echo "::warning::Could not report the $STATUS deploy to $API_URL"
