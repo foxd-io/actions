@@ -27,6 +27,11 @@ name: Deploy static site
 # from @foxd-io/content, which the site lists as a dev dependency. Dev builds
 # get drafts and push the schema; prod builds get published content. An admin
 # links the repository to its site in the API once.
+#
+# This makes every deploy of such a site depend on api.foxd.io, code-only ones
+# included: if the API is down, `content` fails and nothing deploys. That is
+# deliberate. Building without the content would ship a site with its events
+# or vendors missing, which is worse than shipping late.
 
 on:
   workflow_call:
