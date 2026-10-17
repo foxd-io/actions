@@ -1,0 +1,268 @@
+name: Publish release
+
+# Uploads files a build produced to the GCS bucket "<bucket_prefix>-<env>",
+# and optionally writes a draft entry that links them into a site's content
+# on api.foxd.io. The calling workflow must grant `id-token: write`.
+#
+#   jobs:
+#     build:
+#       ...                         # uploads artifacts named myapp-*
+#     publish:
+#       needs: build
+#       uses: foxd-io/actions/.github/workflows/publish-release.yml@v1
+#       with:
+#         artifact_pattern: myapp-*
+#         bucket_prefix: downloads-example-com
+#         content: ${{ github.event_name == 'release' }}
+#         content_site: <tenant id>
+#         content_type: releases
+#         content_data: |
+#           { version: $version, date: $date, notes: $notes,
+#             download: $files["myapp-linux.zip"] }
+#
+# Files land at <path_prefix>/<ref name>/<file>: a v* tag (or a published
+# release, whose ref is its tag) goes to prod, anything else to dev as
+# main-<short sha>. It uploads as gh-<repository with dots as dashes>, the
+# per-repo account the foxd-io/infra base stack creates, which only has
+# access to its own prefix. Prod only publishes from a v* tag.
+#
+# With `content: true`, the `content` job writes one entry to the site through
+# PUT /site-build/sites/<site>/entries/<type>/<slug>, as the repository's
+# GitHub org. An admin grants the org that type once, as a content source of
+# the site. The entry is always a draft: it shows on the preview site, and the
+# site owner publishes it. A rerun updates the fields it sends and keeps the
+# rest. `content_data` is a jq program with these variables:
+#
+#   $files       {"<file name>": "<public URL>"} for every uploaded file
+#   $version     the tag without its leading v, or main-<short sha>
+#   $tag         the ref name the files were uploaded under
+#   $date        the release's publish date (or today), YYYY-MM-DD
+#   $notes       the GitHub release body, "" outside a release
+#   $prerelease  whether the GitHub release is marked as a pre-release
+#
+# Neither job runs repository code: they download the build's artifacts and
+# call gcloud, jq and curl. The jq program comes from the calling workflow,
+# which already decides what the token may do.
+
+on:
+  workflow_call:
+    inputs:
+      artifact_pattern:
+        description: "Artifacts of this run to publish, as a download-artifact pattern"
+        required: true
+        type: string
+      bucket_prefix:
+        description: "Bucket name without the -dev/-prod suffix"
+        required: true
+        type: string
+      path_prefix:
+        description: "Folder in the bucket. Empty uses the repository name"
+        type: string
+        default: ""
+      content:
+        description: "Write a draft content entry that links the files"
+        type: boolean
+        default: false
+      content_site:
+        description: "Tenant id of the site on api.foxd.io"
+        type: string
+        default: ""
+      content_type:
+        description: "Content type key, e.g. releases"
+        type: string
+        default: ""
+      content_slug:
+        description: "Entry slug. Empty uses <path_prefix>-<version> with every run of other characters as one hyphen"
+        type: string
+        default: ""
+      content_data:
+        description: "jq program that outputs the entry's data object. See the variables above"
+        type: string
+        default: ""
+      content_api_url:
+        description: "API that stores the content. Also the audience of the OIDC token"
+        type: string
+        default: "https://api.foxd.io"
+      workload_identity_provider:
+        description: "Workload Identity provider resource name"
+        type: string
+        default: "projects/324306161120/locations/global/workloadIdentityPools/github/providers/github-actions"
+      service_account:
+        description: "Service account to impersonate. Empty uses the repo's gh-<repo>@foxd-io.iam.gserviceaccount.com"
+        type: string
+        default: ""
+    outputs:
+      files:
+        description: 'JSON object of every uploaded file name to its public URL'
+        value: ${{ jobs.upload.outputs.files }}
+      version:
+        description: "The tag without its leading v, or main-<short sha>"
+        value: ${{ jobs.upload.outputs.version }}
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job with Google Cloud access. No checkout, no install, no build.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      files: ${{ steps.upload.outputs.files }}
+      version: ${{ steps.target.outputs.version }}
+      tag: ${{ steps.target.outputs.tag }}
+      path_prefix: ${{ steps.target.outputs.path_prefix }}
+    steps:
+      - name: Resolve target
+        id: target
+        env:
+          BUCKET_PREFIX: ${{ inputs.bucket_prefix }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          SERVICE_ACCOUNT: ${{ inputs.service_account }}
+        run: |
+          set -euo pipefail
+          # Releases are tags, so prod never gets an untagged build.
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              ENVIRONMENT=prod
+              TAG="$GITHUB_REF_NAME"
+              VERSION="${TAG#v}"
+              ;;
+            refs/heads/main)
+              ENVIRONMENT=dev
+              TAG="main-${GITHUB_SHA::7}"
+              VERSION="$TAG"
+              ;;
+            *)
+              echo "::error::Only main and v* tags publish, not $GITHUB_REF"
+              exit 1
+              ;;
+          esac
+
+          REPO="${GITHUB_REPOSITORY#*/}"
+          : "${PATH_PREFIX:=$REPO}"
+          if [ -z "$SERVICE_ACCOUNT" ]; then
+            SERVICE_ACCOUNT="gh-$(echo "$REPO" | tr '[:upper:].' '[:lower:]-')@foxd-io.iam.gserviceaccount.com"
+          fi
+
+          {
+            echo "bucket=$BUCKET_PREFIX-$ENVIRONMENT"
+            echo "path_prefix=$PATH_PREFIX"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "service_account=$SERVICE_ACCOUNT"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ inputs.artifact_pattern }}
+          merge-multiple: true
+          path: dist
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ steps.target.outputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # A rerun overwrites with the same build, so it is safe to repeat.
+      - name: Upload
+        id: upload
+        env:
+          BUCKET: ${{ steps.target.outputs.bucket }}
+          PREFIX: ${{ steps.target.outputs.path_prefix }}/${{ steps.target.outputs.tag }}
+          PATTERN: ${{ inputs.artifact_pattern }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(dist/*)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::No files matched artifacts $PATTERN"
+            exit 1
+          fi
+          gcloud storage cp "${FILES[@]}" "gs://$BUCKET/$PREFIX/"
+
+          BASE="https://storage.googleapis.com/$BUCKET/$PREFIX"
+          JSON="$(for file in "${FILES[@]}"; do basename "$file"; done \
+            | jq -Rnc --arg base "$BASE" '[inputs | {key: ., value: "\($base)/\(@uri "\(.)")"}] | from_entries')"
+          echo "files=$JSON" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Published $PREFIX"
+            echo
+            echo "| File | Link |"
+            echo "| --- | --- |"
+            echo "$JSON" | jq -r 'to_entries[] | "| \(.key) | \(.value) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  content:
+    needs: upload
+    if: inputs.content
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The id-token is for the API, not Google Cloud. No checkout.
+    permissions:
+      id-token: write
+    steps:
+      - name: Write entry
+        env:
+          API_URL: ${{ inputs.content_api_url }}
+          SITE: ${{ inputs.content_site }}
+          TYPE: ${{ inputs.content_type }}
+          SLUG: ${{ inputs.content_slug }}
+          PROGRAM: ${{ inputs.content_data }}
+          FILES: ${{ needs.upload.outputs.files }}
+          VERSION: ${{ needs.upload.outputs.version }}
+          TAG: ${{ needs.upload.outputs.tag }}
+          PATH_PREFIX: ${{ needs.upload.outputs.path_prefix }}
+          NOTES: ${{ github.event.release.body }}
+          PRERELEASE: ${{ github.event.release.prerelease || false }}
+          PUBLISHED_AT: ${{ github.event.release.published_at }}
+        run: |
+          set -euo pipefail
+          for name in SITE TYPE PROGRAM; do
+            if [ -z "${!name}" ]; then
+              echo "::error::content needs content_${name,,}"
+              exit 1
+            fi
+          done
+
+          if [ -z "$SLUG" ]; then
+            SLUG="$(echo "$PATH_PREFIX-$VERSION" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+          fi
+          DATE="${PUBLISHED_AT:0:10}"
+          : "${DATE:=$(date -u +%F)}"
+
+          jq -n \
+            --argjson files "$FILES" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg date "$DATE" \
+            --arg notes "$NOTES" \
+            --argjson prerelease "$PRERELEASE" \
+            "{data: ($PROGRAM)}" > "$RUNNER_TEMP/entry.json"
+
+          # call <output file> <curl args...>: fail the step with the API's
+          # error message rather than a bare status code.
+          call() {
+            local out="$1"; shift
+            if ! curl -sS --fail-with-body -o "$out" "$@"; then
+              echo "::error::$(jq -r '.message // .' "$out" 2>/dev/null || cat "$out")"
+              exit 1
+            fi
+          }
+
+          call "$RUNNER_TEMP/token.json" -G \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$API_URL" "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          TOKEN="$(jq -r .value "$RUNNER_TEMP/token.json")"
+          rm "$RUNNER_TEMP/token.json"
+          echo "::add-mask::$TOKEN"
+
+          call "$RUNNER_TEMP/response.json" -X PUT \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            --data-binary @"$RUNNER_TEMP/entry.json" \
+            "$API_URL/site-build/sites/$SITE/entries/$TYPE/$SLUG"
+
+          echo "Draft $TYPE entry \`$SLUG\` saved; publish it from the dashboard." >> "$GITHUB_STEP_SUMMARY"
