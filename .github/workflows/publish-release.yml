@@ -221,9 +221,10 @@ jobs:
           PUBLISHED_AT: ${{ github.event.release.published_at }}
         run: |
           set -euo pipefail
-          for name in SITE TYPE PROGRAM; do
-            if [ -z "${!name}" ]; then
-              echo "::error::content needs content_${name,,}"
+          for input in content_site:SITE content_type:TYPE content_data:PROGRAM; do
+            var="${input#*:}"
+            if [ -z "${!var}" ]; then
+              echo "::error::content needs ${input%%:*}"
               exit 1
             fi
           done
@@ -241,7 +242,9 @@ jobs:
             --arg date "$DATE" \
             --arg notes "$NOTES" \
             --argjson prerelease "$PRERELEASE" \
-            "{data: ($PROGRAM)}" > "$RUNNER_TEMP/entry.json"
+            "{data: (
+          $PROGRAM
+          )}" > "$RUNNER_TEMP/entry.json"
 
           # call <output file> <curl args...>: fail the step with the API's
           # error message rather than a bare status code.
